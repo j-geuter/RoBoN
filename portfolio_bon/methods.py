@@ -135,14 +135,7 @@ def _wrap_output(
         "metrics": extra_metrics or {},
     }
 
-def equal_method(
-        by_prompt: Dict, 
-        n: int,
-        beta: float, 
-        task: str, 
-        plot: bool = False,
-        **kwargs
-    ):
+def equal_method(by_prompt: Dict, n: int, **kwargs):
     """
     Distribute exactly n samples across k models as evenly as possible and RETURN INDICES:
       out[pid] -> List[(model_alias, idx)].
@@ -151,7 +144,6 @@ def equal_method(
     - Respects per-model capacity; leftover quota is reassigned round-robin to models with remaining items.
     """
     out: Dict[str, List[Tuple[str, int]]] = {}
-   
 
     for pid, entry in by_prompt.items():
         models = list(entry["models"].keys())
@@ -198,8 +190,8 @@ def equal_method(
         # Truncate in the unlikely event we exceeded n due to rounding
         if len(chosen_ids) > n:
             chosen_ids = chosen_ids[:n]
-            out[pid] = chosen_ids
-        
+
+        out[pid] = chosen_ids
 
     return out
 
@@ -209,7 +201,6 @@ def routed_online_best_of_n(
         by_prompt: Dict, 
         n: int, 
         beta: float, 
-        task: str, 
         plot: bool = False,
         **kwargs
     ):

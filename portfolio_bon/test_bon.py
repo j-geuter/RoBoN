@@ -537,15 +537,25 @@ def plot_grid(
     methods: List[str],
     reward_key="rm_score",
     out_path=None,
-    phase1_share=0.5,
     agreement_weight=0.3,
     hard_bon=False,
 ):
+    from cycler import cycler
+    plt.style.use('seaborn-v0_8')
+    plt.rcParams['axes.prop_cycle'] = cycler('color', [
+        '#1b9e77',  # greenish
+        '#d95f02',  # orange
+        '#7570b3',   # purple
+        '#e7298a',  # pink
+        "#7de409",  # green
+        "#fdc62d",  # yellow
+        "#7e4e17",  # brown
+    ])
 
     n_rows = len(datasets)
     n_cols = len(betas)
     fig, axes = plt.subplots(
-        n_rows, n_cols, figsize=(4.8 * n_cols, 1 + 3.6 * n_rows), squeeze=False, sharey="row"
+        n_rows, n_cols, figsize=(4.8 * n_cols, 1 + 3.6 * n_rows), squeeze=False, sharey="col"
     )
     fig.suptitle(f"{out_path.split('.')[0]}", fontsize=16)
     all_lines = []
@@ -562,7 +572,9 @@ def plot_grid(
         data_for_methods = build_records_by_prompt_for_methods(data, use_models)
 
         for j, beta in tqdm(enumerate(betas), desc="Betas"):
-            ax = axes[i][j]
+            ax = axes[j][i]
+            if j == 0:
+                ax.set_title(f"{ds}", fontsize=18)
 
             # model lines
             for m in use_models or data["models"]:
@@ -574,7 +586,7 @@ def plot_grid(
                     los.append(per_n.get(n, [None])[1])
                     his.append(per_n.get(n, [None])[2])
                 x = np.array(ns, dtype=int)
-                ax.plot(x, means, marker="o", label=m)
+                ax.plot(x, means, marker="o", label=m, alpha=0.4)
                 #ax.fill_between(x, np.array(means)-np.array(los), np.array(means)+np.array(his), alpha=0.15)
 
             # average line across models
@@ -601,7 +613,6 @@ def plot_grid(
                     data_for_methods,
                     ns,
                     beta,
-                    phase1_share=phase1_share,
                     agreement_weight=agreement_weight,
                     hard_bon=hard_bon
                 )
@@ -615,14 +626,15 @@ def plot_grid(
 
             # Ax cosmetics
             ylabel = "Avg accuracy" if task == "math" else "Avg # passed tests"
-            ax.set_title(f"{ds} — β={beta:g}")
-            ax.set_xlabel("n (first n)")
-            ax.set_ylabel(ylabel)
+            ax.set_xlabel("n")
+            if i == 0:
+                ax.set_ylabel(ylabel)
             ax.set_xscale("log", base=2)
             ax.grid(True, which="both", linestyle="--", alpha=0.3)
 
-            if i == 0 and j == n_cols - 1:
-                ax.legend(title="Method", fontsize=8)
+            if j == 0 and i == n_cols - 1:
+                leg = ax.legend(fontsize=12, frameon=True, fancybox=True, framealpha=0.7, loc="lower right")
+                leg.get_frame().set_facecolor("white")
 
     plt.tight_layout()
     out_path = timestamped_path(out_path)
@@ -660,24 +672,21 @@ def main():
     ap.add_argument(
         "--methods",
         default="equal,RoBoN",
-        help='Comma-separated portfolio methods (default: "equal,p2p")',
+        help='Comma-separated portfolio methods (default: "equal,RoBoN")',
     )
     ap.add_argument(
-        "--reward_field", default="rm_score", help="Reward key for selection (default: rm_score)"
-    )
-    ap.add_argument(
-        "--phase1_share", type=float, default=0.5, help="Share of phase 1 (default: 0.5)"
+        "--reward_field", default="rm_normalized", help="Reward key for selection (default: rm_normalized)"
     )
     ap.add_argument(
         "--agreement_weight",
         type=float,
-        default=0.3,
-        help="Agreement weight for p2p-agreement (default: 0.3)",
+        default=0.4,
+        help="Agreement weight for RoBoN method (default: 0.4)",
     )
     ap.add_argument(
-        "--hard_bon", 
+        "--not_hard_bon", 
         action="store_true",
-        help="Use hard Best-of-n instead of soft for final response selection (still uses beta in methods)."
+        help="Do not use hard Best-of-n for final response selection. Instead, use soft BoN."
     )
     ap.add_argument(
         "--area_over_n", 
@@ -707,9 +716,8 @@ def main():
         methods,
         reward_key=args.reward_field,
         out_path=args.out,
-        phase1_share=args.phase1_share,
         agreement_weight=args.agreement_weight,
-        hard_bon=args.hard_bon
+        hard_bon=not args.not_hard_bon
     )
 
     if args.area_over_n:
