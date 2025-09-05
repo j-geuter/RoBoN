@@ -552,13 +552,11 @@ def plot_grid(
         "#7e4e17",  # brown
     ])
 
-    n_rows = len(datasets)
-    n_cols = len(betas)
+    n_rows = len(betas)
+    n_cols = len(datasets)
     fig, axes = plt.subplots(
         n_rows, n_cols, figsize=(4.8 * n_cols, 1 + 3.6 * n_rows), squeeze=False, sharey="col"
     )
-    fig.suptitle(f"{out_path.split('.')[0]}", fontsize=16)
-    all_lines = []
 
     for i, ds in tqdm(enumerate(datasets), total=len(datasets), desc="Datasets"):
         task = infer_task_from_dataset(ds)
