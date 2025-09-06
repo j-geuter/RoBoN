@@ -13,7 +13,7 @@ pip install -r requirements.txt
 ```
 
 ## Create Plots
-Then, from the `portfolio_bon` folder you can create the plots for RoBoN with;
+Then, from the `portfolio_bon` folder you can create the plots for RoBoN with:
 ```python
 python test_bon.py --runs_dir=<your-data-dir>
 ```
