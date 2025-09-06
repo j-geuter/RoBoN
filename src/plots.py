@@ -1,30 +1,25 @@
 #!/usr/bin/env python3
 # test_bon.py
 # Multi-dataset soft Best-of-n figure:
-# - rows = datasets
-# - cols = betas
+# - rows = betas
+# - cols = datasets
 # Lines per subplot:
 #   * one per model (selection by reward, metric = accuracy (math) or #passed tests (code))
 #   * "average" = average of per-model curves (prompt-wise mean across selected models)
-#   * one per requested portfolio method (equal, p2p, ...), implemented in methods.py
+#   * one per requested portfolio method (equal, RoBoN, ...), implemented in methods.py
 #
 # Expected JSONL per record:
 #   math:  {"id", "question", "responses":[{"rm_score":float, "correct":bool/int, ...}, ...]}
-#   code:  {"task_id","prompt","tests",
-#           "responses":[{"rm_score":float, "tests_scores":[0/1,...] or "tests_score_avg":float, ...}, ...]}
 
-import os, glob, json, math, argparse
-from collections import defaultdict, OrderedDict
+import os, argparse
+from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 import matplotlib.pyplot as plt
-import ast
+from matplotlib.ticker import PercentFormatter
 from tqdm import tqdm
-from time import time
 
-from utils import timestamped_path
-
-# Load methods
+from utils import timestamped_path, infer_task_from_dataset, to_float, count_asserts, iter_records, _mean_ci_auto, parse_list, binary_mean_and_wilson
 from methods import METHODS_REGISTRY  # dict: name -> fn
 
 # ------------------ Defaults ------------------
@@ -34,108 +29,8 @@ DEFAULT_MODELS = [
     "llama-3.1-8b",
     "qwen-coder-7b",
 ]
-# DEFAULT_DATASETS = ["MATH500", "OlympiadBench", "MinervaMath", "HumanEval", "MBPP"]
 DEFAULT_DATASETS = ["MATH500", "OlympiadBench", "MinervaMath"]
 DEFAULT_BETAS = [100000]
-
-
-# ------------------ Utilities ------------------
-def infer_task_from_dataset(name: str) -> str:
-    name = name.lower()
-    if name in {"humaneval", "mbpp"}:
-        return "code"
-    return "math"
-
-
-def parse_list(s: str, conv=str):
-    return [conv(x.strip()) for x in s.split(",") if x.strip()]
-
-
-def safe_softmax_beta(scores: np.ndarray, beta: float) -> np.ndarray:
-    if scores.size == 0:
-        return np.zeros_like(scores, dtype=np.float64)
-    m = float(np.max(scores))
-    z = beta * (scores - m)
-    # z = np.clip(z, -60.0, 60.0)
-    ez = np.exp(z)
-    denom = max(float(ez.sum()), 1e-10)
-    return ez / denom
-
-
-def expected_metric(rewards: np.ndarray, outcomes: np.ndarray, beta: float) -> float:
-    w = safe_softmax_beta(rewards, beta)
-    return float(np.dot(w, outcomes))
-
-
-def ci95(x: np.ndarray) -> Tuple[float, float]:
-    x = x[~np.isnan(x)]
-    if x.size == 0:
-        return float("nan"), float("nan")
-    m = float(np.mean(x))
-    sd = float(np.std(x, ddof=1)) if x.size > 1 else 0.0
-    se = sd / max(math.sqrt(x.size), 1e-10)
-    return m, 1.96 * se
-
-
-def count_asserts(tests_src: str) -> int:
-    try:
-        t = ast.parse(tests_src)
-    except Exception:
-        return 0
-
-    class V(ast.NodeVisitor):
-        def __init__(self):
-            self.n = 0
-
-        def visit_Assert(self, node):
-            self.n += 1
-
-    v = V()
-    v.visit(t)
-    return v.n
-
-
-def _mean_ci_auto(vals: List[float]) -> Tuple[float, float, float]:
-    arr = np.asarray(vals, dtype=float)
-    arr = arr[np.isfinite(arr)]
-    n = len(arr)
-    if n == 0:
-        return (np.nan, np.nan, np.nan)
-    m = float(arr.mean())
-    # if binary -> Wilson; else -> normal approx on mean
-    is_binary = np.all((arr == 0.0) | (arr == 1.0))
-    if is_binary:
-        z = 1.959963984540054
-        denom = 1.0 + z * z / n
-        center = (m + z * z / (2 * n)) / denom
-        half = z * np.sqrt((m * (1 - m) + z * z / (4 * n)) / n) / denom
-        lo, hi = max(0.0, center - half), min(1.0, center + half)
-        return (m, lo, hi)
-    else:
-        # normal CI on mean of bounded [0,1] values
-        z = 1.959963984540054
-        se = float(arr.std(ddof=1) / np.sqrt(max(n, 1)))
-        lo, hi = m - z * se, m + z * se
-        lo, hi = float(max(0.0, lo)), float(min(1.0, hi))
-        return (m, lo, hi)
-
-
-def iter_records(run_dir: str, task: str, dataset: str):
-    pat = os.path.join(run_dir, task, dataset, "*", "*.jsonl")
-    for path in glob.glob(pat):
-        model_alias = os.path.basename(os.path.dirname(path))
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    yield model_alias, json.loads(line)
-
-
-def to_float(v):
-    try:
-        return float(v)
-    except Exception:
-        return None
-
 
 def pick_argmax_reward(entry, chosen_ids: List[Tuple[str, int]], **kwargs) -> Tuple[float, float]:
     """Return (y, rm) of the single chosen response: the argmax-reward inside the union."""
@@ -211,30 +106,10 @@ def pick_sbon_reward(
     return (float(y[j]), float(r[j]))
 
 
-def binary_mean_and_wilson(acc_list: List[float], alpha=0.05):
-    """acc_list entries are 0/1 (math accuracy or code pass@1)."""
-    arr = np.asarray(acc_list, dtype=float)
-    arr = arr[np.isfinite(arr)]
-    n = len(arr)
-    if n == 0:
-        return (np.nan, np.nan, np.nan)
-    p = float(arr.mean())
-    # Wilson score interval
-    from math import sqrt
-
-    z = 1.959963984540054  # ~95%
-    denom = 1 + z * z / n
-    center = (p + z * z / (2 * n)) / denom
-    half = z * sqrt((p * (1 - p) + z * z / (4 * n)) / n) / denom
-    return (p, max(0.0, center - half), min(1.0, center + half))
-
-
 # ------------------ Data aggregation ------------------
 # We build a structure per dataset:
 # prompts[pid]["models"][model] = {"rm": np.array, "y": np.array} where
-#   - math: y = 0/1 accuracy per response
-#   - code: y = #passed-tests per response (float)
-# prompts[pid]["tests_count"] for code
+#   - math: y = 0/1 correctness per response
 
 
 def load_dataset_runs(
@@ -277,19 +152,7 @@ def load_dataset_runs(
                 y.append(cv)
                 answers.append(answer)
         else:  # code
-            tests_src = rec.get("tests", "")
-            tcount = count_asserts(tests_src)
-            for r in resp:
-                rv = to_float(r.get(reward_key, None))
-                if "tests_scores" in r and isinstance(r["tests_scores"], list):
-                    passed = float(sum(int(bool(x)) for x in r["tests_scores"]))
-                else:
-                    # Use average proportion times count (may be float)
-                    avg = to_float(r.get("tests_score_avg", None))
-                    passed = float(avg * tcount) if (avg is not None and tcount > 0) else None
-                rm.append(rv)
-                y.append(passed)
-            prompts[pid]["tests_count"] = tcount
+            raise(NotImplementedError("Code task not implemented yet."))
 
         prompts[pid]["models"][model_alias] = {
             "rm": np.array([(-1e9 if v is None else v) for v in rm], dtype=np.float64),
@@ -310,17 +173,15 @@ def per_model_curve(data: Dict, model_alias: str, ns: List[int], beta: float, ha
       - Record its y as the per-prompt accuracy value (0/1 for math; fraction for code).
       - Return dict: n -> [mean_acc, ci_lo, ci_hi].
     """
-    task = data["task"]
     prompts = data["prompts"]
     per_n_values = {}
 
     for n in ns:
         accs = []
-        for pid, entry in prompts.items():
+        for _, entry in prompts.items():
             if model_alias not in entry["models"]:
                 continue
             rm_all = entry["models"][model_alias]["rm"]
-            y_all = entry["models"][model_alias]["y"]  # math: 0/1; code: fraction in [0,1]
             L = int(getattr(rm_all, "size", len(rm_all)))
             k = min(n, L)
             if k <= 0:
@@ -351,18 +212,16 @@ def average_curve(data: Dict, model_aliases: List[str], ns: List[int], beta: flo
       - Return dict: n -> [mean_acc, ci_lo, ci_hi].
     This matches "average over individual models" when prompts overlap.
     """
-    task = data["task"]
     prompts = data["prompts"]
     per_n_values = {}
 
     for n in ns:
         pooled = []
-        for pid, entry in prompts.items():
+        for _, entry in prompts.items():
             for m in model_aliases:
                 if m not in entry["models"]:
                     continue
                 rm_all = entry["models"][m]["rm"]
-                y_all = entry["models"][m]["y"]
                 L = int(getattr(rm_all, "size", len(rm_all)))
                 k = min(n, L)
                 if k <= 0:
@@ -400,10 +259,6 @@ def build_records_by_prompt_for_methods(data, use_models: List[str]):
             by_prompt[pid] = {"models": record, "extra": extra}
     return {"task": task, "by_prompt": by_prompt}
 
-from typing import List, Optional
-import os, numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.ticker import PercentFormatter
 
 def plot_avg_selection_over_n_area(
     runs_dir: str,
@@ -413,7 +268,6 @@ def plot_avg_selection_over_n_area(
     ns: List[int],
     beta: float,
     reward_key: str = "rm_score",
-    normalize=None,
     out_path: Optional[str] = None,
 ):
     """
@@ -481,14 +335,14 @@ def plot_avg_selection_over_n_area(
     S_plot = np.where(np.isfinite(S), S, 0.0)
 
     ax.stackplot(x, S_plot, labels=model_list)
-    ax.set_xlabel("n (first n)")
+    ax.set_xlabel("n")
     ax.set_ylabel("Selection share (%) per question")
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=100))
     ax.set_ylim(0.0, 100.0)
 
-    ax.set_title(f"{dataset} — method={method_name}, β={beta:g}")
+    ax.set_title(f"{dataset}")
     ax.grid(True, linestyle="--", alpha=0.3)
-    ax.legend(loc="upper left", fontsize=8, title="Model", ncols=1)
+    ax.legend(loc="upper left", fontsize=8, ncols=1)
 
     if out_path is None:
         out_path = f"selection_area_over_n_{dataset}_{method_name}_pct_beta{beta:g}.png"
@@ -513,15 +367,8 @@ def portfolio_method_curve(
                 y_pick, _ = pick_argmax_reward(entry, chosen_ids)
             else:
                 y_pick, _ = pick_sbon_reward(entry, chosen_ids, beta)
-            # For math (0/1) this is already binary. For code, if you want pass@1:
-            # y_pick = 1.0 if y_pick >= 1.0 else 0.0   # (if y stores fraction tests passed)
             accs.append(0.0 if not np.isfinite(y_pick) else y_pick)
         mean_acc, ci_lo, ci_hi = binary_mean_and_wilson(accs)
-        # Accept dict or list of floats
-        # if isinstance(vals_by_prompt, dict):
-        #    vals = [v for v in vals_by_prompt.values() if v is not None]
-        # else:
-        #    vals = [v for v in vals_by_prompt if v is not None]
 
         per_n_values[n] = [mean_acc, ci_lo, ci_hi]
     return per_n_values
@@ -588,7 +435,6 @@ def plot_grid(
                 #ax.fill_between(x, np.array(means)-np.array(los), np.array(means)+np.array(his), alpha=0.15)
 
             # average line across models
-
             means, los, his = [], [], []
             for n in ns:
                 n_means = np.array([model_curves[m].get(n, [None])[0] for m in use_models], dtype=np.float64)
@@ -719,31 +565,28 @@ def main():
     )
 
     if args.area_over_n:
-        # If the user specified --methods, make one plot PER METHOD as requested.
-        # Otherwise, fall back to the single --method argument.
-        methods_for_area = ['RoBoN']
-        for meth in methods_for_area:
-            # Build an out path that includes the method name if needed
-            out_path = 'selection_area_over_n.png'
-            if "{method}" in out_path:
-                out_file = out_path.format(method=meth)
+        meth = 'RoBoN'
+        # Build an out path that includes the method name if needed
+        out_path = 'selection_area_over_n.png'
+        if "{method}" in out_path:
+            out_file = out_path.format(method=meth)
+        else:
+            if out_path.lower().endswith(".png") or out_path.lower().endswith(".pdf"):
+                root, ext = os.path.splitext(out_path)
+                out_file = f"{root}_{meth}{ext}"
             else:
-                if out_path.lower().endswith(".png") or out_path.lower().endswith(".pdf"):
-                    root, ext = os.path.splitext(out_path)
-                    out_file = f"{root}_{meth}{ext}"
-                else:
-                    out_file = f"{out_path}_{meth}.png"
+                out_file = f"{out_path}_{meth}.png"
 
-            #try:
+        for beta in betas:
+            print(f"\nPlotting stacked area-over-n for method '{meth}' on datasets {datasets} with beta={beta}...")
             plot_avg_selection_over_n_area(
                 runs_dir=args.runs_dir,
                 dataset=args.datasets,
                 use_models=models,
                 method_name=meth,
                 ns=ns,
-                beta=100000,
+                beta=beta,
                 reward_key=args.reward_field,
-                normalize=True,
                 out_path=out_file,
             )
 
