@@ -262,7 +262,7 @@ def build_records_by_prompt_for_methods(data, use_models: List[str]):
 
 def plot_avg_selection_over_n_area(
     runs_dir: str,
-    dataset: str,
+    datasets: List[str],
     use_models: List[str],
     method_name: str,
     ns: List[int],
@@ -273,7 +273,7 @@ def plot_avg_selection_over_n_area(
     """
     For each n in ns, run the portfolio method and compute, per model, the
     percentage of selections out of n (per question). The stacked area for
-    each n sums to 100%.
+    each n sums to 100%. Averaged over datasets.
 
     Notes:
     - We first divide by n to get per-model fractions; then we renormalize
@@ -282,70 +282,81 @@ def plot_avg_selection_over_n_area(
     if method_name not in METHODS_REGISTRY:
         raise ValueError(f"Unknown method '{method_name}'. Available: {list(METHODS_REGISTRY)}")
     method_fn = METHODS_REGISTRY[method_name]
+    model_list = use_models
 
-    data = load_dataset_runs(runs_dir, dataset, use_models, reward_key=reward_key)
-    data_for_methods = build_records_by_prompt_for_methods(data, use_models)
-    by_prompt = data_for_methods["by_prompt"]
-    model_list = use_models or data["models"]
+    series_per_model = {d: {m: [] for m in model_list} for d in datasets}
+    for d in datasets:
+        data = load_dataset_runs(runs_dir, d, use_models, reward_key=reward_key)
+        data_for_methods = build_records_by_prompt_for_methods(data, use_models)
+        by_prompt = data_for_methods["by_prompt"]
 
-    # Prepare series per model over ns (we will store percentages 0..100)
-    series_per_model = {m: [] for m in model_list}
+        any_valid = False
+        for n in ns:
+            # Expect: method_fn(... ) -> (out_by_pid, counts_by_model)
+            _, counts = method_fn(by_prompt=by_prompt, n=int(n), beta=beta, task=data_for_methods["task"], plot=True)
 
-    any_valid = False
-    for n in ns:
-        # Expect: method_fn(... ) -> (out_by_pid, counts_by_model)
-        # counts_by_model[m] should be "avg # selected per question" (not normalized).
-        _, counts = method_fn(by_prompt=by_prompt, n=int(n), beta=beta, task=data_for_methods["task"], plot=True)
+            # Build raw vector in model order
+            v = np.array([float(counts.get(m, 0.0)) for m in model_list], dtype=float)
 
-        # Build raw vector in model order
-        v = np.array([float(counts.get(m, 0.0)) for m in model_list], dtype=float)
+            # Convert to fractions of n (guard n=0) then to percentages
+            if n > 0:
+                v_frac = v / float(n)
+            else:
+                v_frac = np.zeros_like(v)
 
-        # Convert to fractions of n (guard n=0) then to percentages
-        if n > 0:
-            v_frac = v / float(n)
-        else:
-            v_frac = np.zeros_like(v)
+            # Renormalize column to sum to 100% (robust even if total < 1 due to capacity/leak-free constraints)
+            col_sum = float(np.nansum(v_frac))
+            if col_sum > 0:
+                v_pct = 100.0 * (v_frac / col_sum)
+            else:
+                v_pct = np.zeros_like(v_frac)
 
-        # Renormalize column to sum to 100% (robust even if total < 1 due to capacity/leak-free constraints)
-        col_sum = float(np.nansum(v_frac))
-        if col_sum > 0:
-            v_pct = 100.0 * (v_frac / col_sum)
-        else:
-            v_pct = np.zeros_like(v_frac)
+            for i, m in enumerate(model_list):
+                series_per_model[d][m].append(v_pct[i])
 
-        for i, m in enumerate(model_list):
-            series_per_model[m].append(v_pct[i])
-
-        # Optional: log a concise line
-        log_bits = ", ".join(f"{m}:{v_pct[i]:5.1f}%" for i, m in enumerate(model_list))
-        print(f"n={n}: {log_bits}")
-        any_valid = True
+            # Optional: log a concise line
+            log_bits = ", ".join(f"{m}:{v_pct[i]:5.1f}%" for i, m in enumerate(model_list))
+            print(f"n={n}: {log_bits}")
+            any_valid = True
 
     if not any_valid:
         raise RuntimeError("No usable selections for any n; cannot plot area over n.")
+    average_series_per_model = {m: [] for m in model_list}
+    for m in model_list:
+        for i in range(len(ns)):
+            # Average over datasets, ignoring NaNs
+            vals = [series_per_model[d][m][i] for d in datasets if np.isfinite(series_per_model[d][m][i])]
+            if vals:
+                avg_val = float(np.mean(vals))
+            else:
+                avg_val = float("nan")
+            average_series_per_model[m].append(avg_val)
 
     x = np.array(ns, dtype=float)
     fig, ax = plt.subplots(figsize=(max(8, len(ns) * 0.5), 4.8))
 
     # Stacked series (rows=models, cols=len(ns)) in PERCENT
-    series = [np.array(series_per_model[m], dtype=float) for m in model_list]
+    series = [np.array(average_series_per_model[m], dtype=float) for m in model_list]
     S = np.vstack(series) if len(series) > 0 else np.zeros((0, len(ns)))
 
     # Replace non-finite with zeros for plotting
     S_plot = np.where(np.isfinite(S), S, 0.0)
 
     ax.stackplot(x, S_plot, labels=model_list)
-    ax.set_xlabel("n")
-    ax.set_ylabel("Selection share (%) per question")
+    ax.set_xlabel("n", fontsize=14)
+    ax.set_xscale("log", base=2)
+    ax.set_ylabel("Selection share (%) per question", fontsize=14)
     ax.yaxis.set_major_formatter(PercentFormatter(xmax=100))
     ax.set_ylim(0.0, 100.0)
+    ax.set_xlim(4, 256)
 
-    ax.set_title(f"{dataset}")
+    ax.set_title(f"Share of Models Selected (Averaged over Datasets)")
     ax.grid(True, linestyle="--", alpha=0.3)
-    ax.legend(loc="upper left", fontsize=8, ncols=1)
+    leg = ax.legend(fontsize=12, frameon=True, fancybox=True, framealpha=0.7, loc="lower right")
+    leg.get_frame().set_facecolor("white")
 
     if out_path is None:
-        out_path = f"selection_area_over_n_{dataset}_{method_name}_pct_beta{beta:g}.png"
+        out_path = f"selection_area_over_n_{method_name}_pct_beta{beta:g}.png"
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     plt.tight_layout(); plt.savefig(out_path, dpi=180)
     print(f"Saved stacked percentage area-over-n to {out_path}")
@@ -550,7 +561,7 @@ def main():
     ns = parse_list(args.ns, int)
     betas = parse_list(args.betas, float)
     methods = parse_list(args.methods, str)
-
+    
     plot_grid(
         args.runs_dir,
         datasets,
@@ -563,7 +574,7 @@ def main():
         agreement_weight=args.agreement_weight,
         hard_bon=not args.not_hard_bon
     )
-
+    
     if args.area_over_n:
         meth = 'RoBoN'
         # Build an out path that includes the method name if needed
@@ -581,7 +592,7 @@ def main():
             print(f"\nPlotting stacked area-over-n for method '{meth}' on datasets {datasets} with beta={beta}...")
             plot_avg_selection_over_n_area(
                 runs_dir=args.runs_dir,
-                dataset=args.datasets,
+                datasets=datasets,
                 use_models=models,
                 method_name=meth,
                 ns=ns,

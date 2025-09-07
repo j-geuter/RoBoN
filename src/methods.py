@@ -252,6 +252,7 @@ def routed_online_best_of_n(
                     continue
                 if val > best_val:
                     best_val, best_m = val, m
+            model_counts[best_m] += 1
             if best_m is None:
                 break
 
