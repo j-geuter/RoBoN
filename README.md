@@ -2,9 +2,9 @@
 
 ## Download Data
 You can download the datasets from here:
-```
-https://drive.google.com/file/d/1e-5tKN-sb80xbhEuCinlsX-9u4G8lFdm/view?usp=sharing
-```
+
+[https://drive.google.com/file/d/1e-5tKN-sb80xbhEuCinlsX-9u4G8lFdm/view?usp=sharing](https://drive.google.com/file/d/1f1hhhBwJFUkBwFjg7jhO9wAI8DRbwYHA/view?usp=sharing)
+
 
 ## Install Requirements
 Install the requirementst:
@@ -13,8 +13,8 @@ pip install -r requirements.txt
 ```
 
 ## Create Plots
-Then, from the `portfolio_bon` folder you can create the plots for RoBoN with:
+Then, from the `src` folder you can create the plots for RoBoN with:
 ```python
-python test_bon.py --runs_dir=<your-data-dir>
+python plots.py --runs_dir=<your-data-dir>
 ```
-
+To create the area plot as well, pass `--area_over_n`.
