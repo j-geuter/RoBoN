@@ -24,10 +24,10 @@ from methods import METHODS_REGISTRY  # dict: name -> fn
 
 # ------------------ Defaults ------------------
 DEFAULT_MODELS = [
-    "qwen-math-7b",
     "deepseek-coder-6.7b",
     "llama-3.1-8b",
     "qwen-coder-7b",
+    "qwen-math-7b",
 ]
 DEFAULT_DATASETS = ["MATH500", "OlympiadBench", "MinervaMath"]
 DEFAULT_BETAS = [100000]
