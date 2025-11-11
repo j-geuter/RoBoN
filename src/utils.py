@@ -109,6 +109,8 @@ def _mean_ci_auto(vals: List[float]) -> Tuple[float, float, float]:
 
 def iter_records(run_dir: str, task: str, dataset: str):
     pat = os.path.join(run_dir, task, dataset, "*", "*.jsonl")
+    if not glob.glob(pat):
+        raise ValueError(f"No files found matching pattern: {pat}")
     for path in glob.glob(pat):
         model_alias = os.path.basename(os.path.dirname(path))
         with open(path, "r", encoding="utf-8") as f:

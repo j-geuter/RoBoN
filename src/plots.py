@@ -18,8 +18,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
 from tqdm import tqdm
+import json
+import warnings
 
-from utils import timestamped_path, infer_task_from_dataset, to_float, count_asserts, iter_records, _mean_ci_auto, parse_list, binary_mean_and_wilson
+from utils import timestamped_path, infer_task_from_dataset, to_float, iter_records, _mean_ci_auto, parse_list, binary_mean_and_wilson
 from methods import METHODS_REGISTRY  # dict: name -> fn
 
 # ------------------ Defaults ------------------
@@ -30,7 +32,7 @@ DEFAULT_MODELS = [
     "qwen-math-7b",
 ]
 DEFAULT_DATASETS = ["MATH500", "OlympiadBench", "MinervaMath"]
-DEFAULT_BETAS = [100000]
+DEFAULT_BETAS = [1, 20, 100, 100000]
 
 def pick_argmax_reward(entry, chosen_ids: List[Tuple[str, int]], **kwargs) -> Tuple[float, float]:
     """Return (y, rm) of the single chosen response: the argmax-reward inside the union."""
@@ -266,7 +268,7 @@ def plot_avg_selection_over_n_area(
     use_models: List[str],
     method_name: str,
     ns: List[int],
-    beta: float,
+    robon_beta: float,
     reward_key: str = "rm_score",
     out_path: Optional[str] = None,
 ):
@@ -293,7 +295,7 @@ def plot_avg_selection_over_n_area(
         any_valid = False
         for n in ns:
             # Expect: method_fn(... ) -> (out_by_pid, counts_by_model)
-            _, counts = method_fn(by_prompt=by_prompt, n=int(n), beta=beta, task=data_for_methods["task"], plot=True)
+            _, counts = method_fn(by_prompt=by_prompt, n=int(n), beta=robon_beta, task=data_for_methods["task"], plot=True)
 
             # Build raw vector in model order
             v = np.array([float(counts.get(m, 0.0)) for m in model_list], dtype=float)
@@ -316,6 +318,7 @@ def plot_avg_selection_over_n_area(
 
             # Optional: log a concise line
             log_bits = ", ".join(f"{m}:{v_pct[i]:5.1f}%" for i, m in enumerate(model_list))
+
             print(f"n={n}: {log_bits}")
             any_valid = True
 
@@ -356,13 +359,14 @@ def plot_avg_selection_over_n_area(
     leg.get_frame().set_facecolor("white")
 
     if out_path is None:
-        out_path = f"selection_area_over_n_{method_name}_pct_beta{beta:g}.png"
+        out_path = f"selection_area_over_n_{method_name}_pct_robon-beta{robon_beta:g}.png"
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     plt.tight_layout(); plt.savefig(out_path, dpi=180)
     print(f"Saved stacked percentage area-over-n to {out_path}")
+    return series_per_model
 
 def portfolio_method_curve(
-    method_fn, method_name: str, data_for_methods, ns: List[int], beta: float, hard_bon: bool, **kwargs
+    method_fn, method_name: str, data_for_methods, ns: List[int], beta: float, robon_beta: float, hard_bon: bool, **kwargs
 ):
     """Call method per (dataset, n); method returns per-prompt expected metric list."""
     task = data_for_methods["task"]
@@ -370,7 +374,7 @@ def portfolio_method_curve(
     per_n_values = {n: [] for n in ns}
     # Call once per n with all prompts; method should return dict pid->value OR list aligned in any order
     for n in ns:
-        chosen = method_fn(by_prompt=by_prompt, n=n, beta=beta, task=task, **kwargs)
+        chosen = method_fn(by_prompt=by_prompt, n=n, beta=robon_beta, task=task, **kwargs)
         accs = []
         for pid, entry in by_prompt.items():
             chosen_ids = chosen.get(pid, [])
@@ -392,6 +396,7 @@ def plot_grid(
     use_models: List[str],
     ns: List[int],
     betas: List[float],
+    robon_beta: float,
     methods: List[str],
     reward_key="rm_score",
     out_path=None,
@@ -415,6 +420,40 @@ def plot_grid(
     fig, axes = plt.subplots(
         n_rows, n_cols, figsize=(4.8 * n_cols, 1 + 3.6 * n_rows), squeeze=False, sharey="col"
     )
+
+    save_data = {
+        ds: {
+            "best-of-n": {
+                m: {
+                    beta: {
+                        "n": [],
+                        "mean": [],
+                        "ci_lo": [],
+                        "ci_hi": []
+                    }
+                    for beta in betas
+                } for m in use_models
+            },
+            "average": {
+                beta: {
+                    "n": [],
+                    "mean": [],
+                    "ci_lo": [],
+                    "ci_hi": []
+                }
+                for beta in betas
+            },
+            **{meth: {
+                beta: {
+                    "n": [],
+                    "mean": [],
+                    "ci_lo": [],
+                    "ci_hi": []
+                }
+                for beta in betas
+            } for meth in methods if meth in METHODS_REGISTRY},
+        } for ds in datasets
+    }
 
     for i, ds in tqdm(enumerate(datasets), total=len(datasets), desc="Datasets"):
         task = infer_task_from_dataset(ds)
@@ -441,6 +480,10 @@ def plot_grid(
                     means.append(per_n.get(n, [None])[0])
                     los.append(per_n.get(n, [None])[1])
                     his.append(per_n.get(n, [None])[2])
+                    save_data[ds]["best-of-n"][m][beta]["n"].append(n)
+                    save_data[ds]["best-of-n"][m][beta]["mean"].append(per_n.get(n, [None])[0])
+                    save_data[ds]["best-of-n"][m][beta]["ci_lo"].append(per_n.get(n, [None])[1])
+                    save_data[ds]["best-of-n"][m][beta]["ci_hi"].append(per_n.get(n, [None])[2])
                 x = np.array(ns, dtype=int)
                 ax.plot(x, means, marker="o", label=m, alpha=0.4)
                 #ax.fill_between(x, np.array(means)-np.array(los), np.array(means)+np.array(his), alpha=0.15)
@@ -454,6 +497,10 @@ def plot_grid(
                 means.append(np.nanmean(n_means))
                 los.append(np.nanmean(n_los))
                 his.append(np.nanmean(n_his))
+                save_data[ds]["average"][beta]["n"].append(n)
+                save_data[ds]["average"][beta]["mean"].append(means[-1])
+                save_data[ds]["average"][beta]["ci_lo"].append(los[-1])
+                save_data[ds]["average"][beta]["ci_hi"].append(his[-1])
             x = np.array(ns, dtype=int)
             ax.plot(x, means, marker="o", linestyle="--", color="black", label="average")
             #ax.fill_between(x, np.array(means)-np.array(los), np.array(means)+np.array(his), color="black", alpha=0.10)
@@ -461,6 +508,7 @@ def plot_grid(
             # portfolio methods
             for meth in methods:
                 if meth not in METHODS_REGISTRY:
+                    warnings.warn(f"Unknown method '{meth}'; skipping.")
                     continue
                 per_n = portfolio_method_curve(
                     METHODS_REGISTRY[meth],
@@ -468,6 +516,7 @@ def plot_grid(
                     data_for_methods,
                     ns,
                     beta,
+                    robon_beta=robon_beta,
                     agreement_weight=agreement_weight,
                     hard_bon=hard_bon
                 )
@@ -476,6 +525,10 @@ def plot_grid(
                     means.append(per_n.get(n, [None])[0])
                     los.append(per_n.get(n, [None])[1])
                     his.append(per_n.get(n, [None])[2])
+                    save_data[ds][meth][beta]["n"].append(n)
+                    save_data[ds][meth][beta]["mean"].append(means[-1])
+                    save_data[ds][meth][beta]["ci_lo"].append(los[-1])
+                    save_data[ds][meth][beta]["ci_hi"].append(his[-1])
                 ax.plot(x, means, marker="D", label=meth)
                 #ax.fill_between(x, np.array(means)-np.array(los), np.array(means)+np.array(his), alpha=0.12)
 
@@ -497,6 +550,11 @@ def plot_grid(
     plt.savefig(out_path, dpi=180)
     print(f"Saved figure to {out_path}")
 
+    # Also save the raw data as json
+    data_out_path = out_path.rsplit(".", 1)[0] + ".json"
+    with open(data_out_path, "w") as f:
+        json.dump(save_data, f, indent=2)
+    print(f"Saved raw data to {data_out_path}")
 
 # ------------------ Main ------------------
 def main():
@@ -517,12 +575,18 @@ def main():
         help=f"Comma-separated dataset names (default: {','.join(DEFAULT_DATASETS)})",
     )
     ap.add_argument(
-        "--ns", default="1,4,16,64,256", help="Comma-separated n values (default: 1,4,16,64,256)"
+        "--ns", default="1,4,16,64,256,1024", help="Comma-separated n values (default: 1,4,16,64,256)"
     )
     ap.add_argument(
         "--betas",
         default=",".join(str(b) for b in DEFAULT_BETAS),
-        help=f"Comma-separated beta values (default: {','.join(str(b) for b in DEFAULT_BETAS)})",
+        help=f"Comma-separated beta values (default: {','.join(str(b) for b in DEFAULT_BETAS)}). Used for soft Best-of-n selection. Pass not_hard_bon to enable soft BoN in final selection.",
+    )
+    ap.add_argument(
+        "--robon_beta",
+        default=100000,
+        type=float,
+        help="Beta value for computing RoBoN scores (default: 100000)",
     )
     ap.add_argument(
         "--methods",
@@ -550,6 +614,19 @@ def main():
     )
 
     ap.add_argument(
+        "--skip_accuracy_plots",
+        action="store_true",
+        help="Skip the accuracy plots and only do area-over-n",
+    )
+
+    ap.add_argument(
+        "--task_id",
+        type=int,
+        default=None,
+        help="Optional SLURM array task ID to process a specific dataset only",
+    )
+
+    ap.add_argument(
         "--out", 
         default="bon_grid.png", 
         help="Output PNG file name"
@@ -558,22 +635,28 @@ def main():
 
     models = parse_list(args.models, str)
     datasets = parse_list(args.datasets, str)
+    if args.task_id is not None:
+        if args.task_id < 0 or args.task_id >= len(datasets):
+            raise ValueError(f"Invalid task_id {args.task_id} for datasets of length {len(datasets)}")
+        datasets = [datasets[args.task_id]]
     ns = parse_list(args.ns, int)
     betas = parse_list(args.betas, float)
     methods = parse_list(args.methods, str)
     
-    plot_grid(
-        args.runs_dir,
-        datasets,
-        models,
-        ns,
-        betas,
-        methods,
-        reward_key=args.reward_field,
-        out_path=args.out,
-        agreement_weight=args.agreement_weight,
-        hard_bon=not args.not_hard_bon
-    )
+    if not args.skip_accuracy_plots:
+        plot_grid(
+            args.runs_dir,
+            datasets,
+            models,
+            ns,
+            betas,
+            args.robon_beta,
+            methods,
+            reward_key=args.reward_field,
+            out_path=args.out,
+            agreement_weight=args.agreement_weight,
+            hard_bon=not args.not_hard_bon
+        )
     
     if args.area_over_n:
         meth = 'RoBoN'
@@ -587,19 +670,28 @@ def main():
                 out_file = f"{root}_{meth}{ext}"
             else:
                 out_file = f"{out_path}_{meth}.png"
-
+        area_data = {
+            beta: {} for beta in betas
+        }
         for beta in betas:
             print(f"\nPlotting stacked area-over-n for method '{meth}' on datasets {datasets} with beta={beta}...")
-            plot_avg_selection_over_n_area(
+            beta_data = plot_avg_selection_over_n_area(
                 runs_dir=args.runs_dir,
                 datasets=datasets,
                 use_models=models,
                 method_name=meth,
                 ns=ns,
-                beta=beta,
+                robon_beta=args.robon_beta,
                 reward_key=args.reward_field,
                 out_path=out_file,
             )
+            area_data[beta] = beta_data
+
+        # Save area data to JSON
+        area_data_out_path = out_file.rsplit(".", 1)[0] + "_data.json"
+        with open(area_data_out_path, "w") as f:
+            json.dump(area_data, f, indent=2)
+        print(f"Saved area-over-n data to {area_data_out_path}")
 
 if __name__ == "__main__":
     main()
